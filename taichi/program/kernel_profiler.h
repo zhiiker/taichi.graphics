@@ -1,7 +1,7 @@
 #pragma once
 
-#include "taichi/program/arch.h"
-#include "taichi/lang_util.h"
+#include "taichi/rhi/arch.h"
+#include "taichi/util/lang_util.h"
 
 #include <algorithm>
 #include <map>
@@ -10,14 +10,20 @@
 #include <memory>
 #include <regex>
 
-TLANG_NAMESPACE_BEGIN
+namespace taichi::lang {
 
 struct KernelProfileTracedRecord {
-  std::string name;
+  // kernel attributes
+  int register_per_thread{0};
+  int shared_mem_per_block{0};
+  int grid_size{0};
+  int block_size{0};
+  int active_blocks_per_multiprocessor{0};
+  // kernel time
   float kernel_elapsed_time_in_ms{0.0};
-  float time_since_base{0.0};  // for Timeline
-  // TODO: user defined metrics
-  // std::vector<float> metric_values;
+  float time_since_base{0.0};        // for Timeline
+  std::string name;                  // kernel name
+  std::vector<float> metric_values;  // user selected metrics
 };
 
 struct KernelProfileStatisticalResult {
@@ -27,7 +33,7 @@ struct KernelProfileStatisticalResult {
   double max;
   double total;
 
-  KernelProfileStatisticalResult(const std::string &name)
+  explicit KernelProfileStatisticalResult(const std::string &name)
       : name(name), counter(0), min(0), max(0), total(0) {
   }
 
@@ -47,14 +53,19 @@ class KernelProfilerBase {
   // Needed for the CUDA backend since we need to know which task to "stop"
   using TaskHandle = void *;
 
-  virtual void reinit_with_metrics(const std::vector<std::string> &metrics){
-      TI_NOT_IMPLEMENTED};
+  virtual bool reinit_with_metrics(const std::vector<std::string> metrics) {
+    return false;
+  };  // public API for all backend, do not use TI_NOT_IMPLEMENTED;
 
   virtual void clear() = 0;
 
   virtual void sync() = 0;
 
-  virtual std::string title() const = 0;
+  virtual void update() = 0;
+
+  virtual bool set_profiler_toolkit(std::string toolkit_name) {
+    return false;
+  }
 
   // TODO: remove start and always use start_with_handle
   virtual void start(const std::string &kernel_name){TI_NOT_IMPLEMENTED};
@@ -71,11 +82,6 @@ class KernelProfilerBase {
 
   static void profiler_stop(KernelProfilerBase *profiler);
 
-  virtual void print();
-
-  virtual void trace(KernelProfilerBase::TaskHandle &task_handle,
-                     const std::string &task_name){TI_NOT_IMPLEMENTED};
-
   void query(const std::string &kernel_name,
              int &counter,
              double &min,
@@ -88,10 +94,17 @@ class KernelProfilerBase {
 
   double get_total_time() const;
 
+  void insert_record(const std::string &kernel_name, double duration_ms);
+
+  virtual std::string get_device_name() {
+    std::string str(" ");
+    return str;
+  }
+
   virtual ~KernelProfilerBase() {
   }
 };
 
 std::unique_ptr<KernelProfilerBase> make_profiler(Arch arch, bool enable);
 
-TLANG_NAMESPACE_END
+}  // namespace taichi::lang

@@ -1,90 +1,16 @@
 ---
-sidebar_position: 6
+sidebar_position: 2
 ---
 
-# Objective data-oriented programming
+# Objective Data-Oriented Programming
 
-Taichi is a
-[data-oriented](https://en.wikipedia.org/wiki/Data-oriented_design)
-programming (DOP) language. However, simple DOP makes modularization
-hard.
-
-To allow modularized code, Taichi borrow some concepts from
-object-oriented programming (OOP).
-
-For convenience, let's call the hybrid scheme **objective data-oriented
-programming** (ODOP).
+Taichi is a [Data-Oriented](https://en.wikipedia.org/wiki/Data-Oriented_design) Programming (DOP) language. However, one-size-fits-all DOP makes modularization hard. To allow modularized code, Taichi borrows some concepts from Object-Oriented Programming (OOP). For convenience, let's call the hybrid scheme Objective Data-Oriented Programming (ODOP).
 
 :::note
-More documentation on this topic is on the way ...
+DOP approaches coding in a unique way. While you may be familiar with OOP, the Data-Oriented design indicates that everything is data that can be acted on. This differentiates functionality from data. They are no longer linked by a set of rules. Your DOP routines are general-purpose and deal with enormous volumes of data. To guarantee that the function takes as little effort as possible, you should organize the data as close to the output data as possible.
 :::
 
-A brief example:
+The ODOP scheme allows you to organize data and methods in a class and call the methods to manipulate the data in the Taichi scope. Taichi offers two different types of classes that serve this purpose, and they are distinguished by the two decorators `@ti.data_oriented` and `@ti.dataclass` respectively:
 
-```python
-import taichi as ti
-
-ti.init()
-
-@ti.data_oriented
-class Array2D:
-  def __init__(self, n, m, increment):
-    self.n = n
-    self.m = m
-    self.val = ti.field(ti.f32)
-    self.total = ti.field(ti.f32)
-    self.increment = increment
-    ti.root.dense(ti.ij, (self.n, self.m)).place(self.val)
-    ti.root.place(self.total)
-
-  @staticmethod
-  @ti.func
-  def clamp(x):  # Clamp to [0, 1)
-      return max(0, min(1 - 1e-6, x))
-
-  @ti.kernel
-  def inc(self):
-    for i, j in self.val:
-      ti.atomic_add(self.val[i, j], self.increment)
-
-  @ti.kernel
-  def inc2(self, increment: ti.i32):
-    for i, j in self.val:
-      ti.atomic_add(self.val[i, j], increment)
-
-  @ti.kernel
-  def reduce(self):
-    for i, j in self.val:
-      ti.atomic_add(self.total, self.val[i, j] * 4)
-
-arr = Array2D(128, 128, 3)
-
-double_total = ti.field(ti.f32, shape=())
-
-ti.root.lazy_grad()
-
-arr.inc()
-arr.inc.grad()
-assert arr.val[3, 4] == 3
-arr.inc2(4)
-assert arr.val[3, 4] == 7
-
-with ti.Tape(loss=arr.total):
-  arr.reduce()
-
-for i in range(arr.n):
-  for j in range(arr.m):
-    assert arr.val.grad[i, j] == 4
-
-@ti.kernel
-def double():
-  double_total[None] = 2 * arr.total
-
-with ti.Tape(loss=double_total):
-  arr.reduce()
-  double()
-
-for i in range(arr.n):
-  for j in range(arr.m):
-    assert arr.val.grad[i, j] == 8
-```
+- Decorated with `@ti.data_oriented`, a Data-Oriented class is used when your data is actively updated in the Python scope (such as current time and user input events) and tracked in Taichi kernels. This type of class can have native Python objects as members and must be instantiated in the Python scope. [Data-Oriented Class](./data_oriented_class.md) describes this type of class.
+- Decorated with `@ti.dataclass`, a dataclass is a wrapper of `ti.types.struct`. A dataclass provides more flexibilities. You can define Taichi functions as its methods and call these methods in the Taichi scope. [Taichi Dataclass](./dataclass.md) describes this type of class.

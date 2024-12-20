@@ -1,11 +1,13 @@
 #include "kernel_profiler.h"
 
 #include "taichi/system/timer.h"
-#include "taichi/backends/cuda/cuda_driver.h"
-#include "taichi/backends/cuda/cuda_profiler.h"
+#include "taichi/rhi/cuda/cuda_driver.h"
+#include "taichi/rhi/cuda/cuda_profiler.h"
 #include "taichi/system/timeline.h"
 
-TLANG_NAMESPACE_BEGIN
+#include "taichi/rhi/amdgpu/amdgpu_profiler.h"
+
+namespace taichi::lang {
 
 void KernelProfileStatisticalResult::insert_record(double t) {
   if (counter == 0) {
@@ -35,35 +37,6 @@ void KernelProfilerBase::profiler_stop(KernelProfilerBase *profiler) {
 }
 
 // TODO : deprecated
-void KernelProfilerBase::print() {
-  sync();
-  fmt::print("{}\n", title());
-  fmt::print(
-      "========================================================================"
-      "=\n");
-  fmt::print(
-      "[      %     total   count |      min       avg       max   ] Kernel "
-      "name\n");
-  std::sort(statistical_results_.begin(), statistical_results_.end());
-  for (auto &rec : statistical_results_) {
-    auto fraction = rec.total / total_time_ms_ * 100.0f;
-    fmt::print("[{:6.2f}% {:7.3f} s {:6d}x |{:9.3f} {:9.3f} {:9.3f} ms] {}\n",
-               fraction, rec.total / 1000.0f, rec.counter, rec.min,
-               rec.total / rec.counter, rec.max, rec.name);
-  }
-  fmt::print(
-      "------------------------------------------------------------------------"
-      "-\n");
-  fmt::print(
-      "[100.00%] Total kernel execution time: {:7.3f} s   number of records: "
-      "{}\n",
-      get_total_time(), statistical_results_.size());
-
-  fmt::print(
-      "========================================================================"
-      "=\n");
-}
-
 void KernelProfilerBase::query(const std::string &kernel_name,
                                int &counter,
                                double &min,
@@ -94,26 +67,40 @@ double KernelProfilerBase::get_total_time() const {
   return total_time_ms_ / 1000.0;
 }
 
+void KernelProfilerBase::insert_record(const std::string &kernel_name,
+                                       double duration_ms) {
+  // Trace record
+  KernelProfileTracedRecord record;
+  record.name = kernel_name;
+  record.kernel_elapsed_time_in_ms = duration_ms;
+  traced_records_.push_back(record);
+  // Count record
+  auto it = std::find_if(
+      statistical_results_.begin(), statistical_results_.end(),
+      [&](KernelProfileStatisticalResult &r) { return r.name == record.name; });
+  if (it == statistical_results_.end()) {
+    statistical_results_.emplace_back(record.name);
+    it = std::prev(statistical_results_.end());
+  }
+  it->insert_record(duration_ms);
+  total_time_ms_ += duration_ms;
+}
+
 namespace {
 // A simple profiler that uses Time::get_time()
 class DefaultProfiler : public KernelProfilerBase {
  public:
-  explicit DefaultProfiler(Arch arch)
-      : title_(fmt::format("{} Profiler", arch_name(arch))) {
-  }
-
   void sync() override {
   }
 
+  void update() override {
+  }
+
   void clear() override {
-    sync();
+    // sync(); //decoupled: trigger from the foront end
     total_time_ms_ = 0;
     traced_records_.clear();
     statistical_results_.clear();
-  }
-
-  std::string title() const override {
-    return title_;
   }
 
   void start(const std::string &kernel_name) override {
@@ -146,21 +133,28 @@ class DefaultProfiler : public KernelProfilerBase {
  private:
   double start_t_;
   std::string event_name_;
-  std::string title_;
 };
 
 }  // namespace
 
 std::unique_ptr<KernelProfilerBase> make_profiler(Arch arch, bool enable) {
+  if (!enable)
+    return nullptr;
   if (arch == Arch::cuda) {
 #if defined(TI_WITH_CUDA)
     return std::make_unique<KernelProfilerCUDA>(enable);
 #else
     TI_NOT_IMPLEMENTED;
 #endif
+  } else if (arch == Arch::amdgpu) {
+#if defined(TI_WITH_AMDGPU)
+    return std::make_unique<KernelProfilerAMDGPU>();
+#else
+    TI_NOT_IMPLEMENTED
+#endif
   } else {
-    return std::make_unique<DefaultProfiler>(arch);
+    return std::make_unique<DefaultProfiler>();
   }
 }
 
-TLANG_NAMESPACE_END
+}  // namespace taichi::lang

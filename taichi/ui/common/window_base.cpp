@@ -1,13 +1,21 @@
 #include "taichi/ui/common/window_base.h"
+#include "taichi/rhi/common/window_system.h"
 
-TI_UI_NAMESPACE_BEGIN
+namespace taichi::ui {
 
-WindowBase ::WindowBase(AppConfig config) : config_(config) {
-  glfw_window_ = create_glfw_window_(config_.name, config_.width,
-                                     config_.height, config_.vsync);
-  glfwSetWindowUserPointer(glfw_window_, this);
-  set_callbacks();
-  last_record_time_ = glfwGetTime();
+#define CHECK_WINDOW_SHOWING        \
+  TI_ERROR_IF(!config_.show_window, \
+              "show_window must be True to use this method")
+
+WindowBase::WindowBase(AppConfig config) : config_(config) {
+  if (config_.show_window) {
+    glfw_window_ = create_glfw_window_(config_.name, config_.width,
+                                       config_.height, config_.window_pos_x,
+                                       config_.window_pos_y, config_.vsync);
+    glfwSetWindowUserPointer(glfw_window_, this);
+    set_callbacks();
+    last_record_time_ = glfwGetTime();
+  }
 }
 
 void WindowBase::set_callbacks() {
@@ -16,17 +24,27 @@ void WindowBase::set_callbacks() {
   glfwSetMouseButtonCallback(glfw_window_, mouse_button_callback);
 
   input_handler_.add_key_callback([&](int key, int action) {
-    if (action == GLFW_PRESS) {
-      events_.push_back({EventType::Press, button_id_to_name(key)});
-    } else if (action == GLFW_RELEASE) {
-      events_.push_back({EventType::Release, button_id_to_name(key)});
+    // Catch exception from button_id_to_name().
+    try {
+      if (action == GLFW_PRESS) {
+        events_.push_back({EventType::Press, button_id_to_name(key)});
+      } else if (action == GLFW_RELEASE) {
+        events_.push_back({EventType::Release, button_id_to_name(key)});
+      }
+    } catch (const std::runtime_error &e) {
+      TI_TRACE("Input: {}.", e.what());
     }
   });
   input_handler_.add_mouse_button_callback([&](int key, int action) {
-    if (action == GLFW_PRESS) {
-      events_.push_back({EventType::Press, button_id_to_name(key)});
-    } else if (action == GLFW_RELEASE) {
-      events_.push_back({EventType::Release, button_id_to_name(key)});
+    // Catch exception from button_id_to_name().
+    try {
+      if (action == GLFW_PRESS) {
+        events_.push_back({EventType::Press, button_id_to_name(key)});
+      } else if (action == GLFW_RELEASE) {
+        events_.push_back({EventType::Release, button_id_to_name(key)});
+      }
+    } catch (const std::runtime_error &e) {
+      TI_TRACE("Input: {}.", e.what());
     }
   });
 }
@@ -35,7 +53,12 @@ CanvasBase *WindowBase::get_canvas() {
   return nullptr;
 }
 
+SceneBase *WindowBase::get_scene() {
+  return nullptr;
+}
+
 void WindowBase::show() {
+  CHECK_WINDOW_SHOWING;
   ++frames_since_last_record_;
 
   double current_time = glfwGetTime();
@@ -55,28 +78,40 @@ void WindowBase::show() {
 }
 
 bool WindowBase::is_pressed(std::string button) {
-  int button_id = buttom_name_to_id(button);
+  int button_id;
+  // Catch exception from buttom_name_to_id().
+  try {
+    button_id = buttom_name_to_id(button);
+  } catch (const std::runtime_error &e) {
+    TI_TRACE("Pressed: {}.", e.what());
+    return false;
+  }
   return input_handler_.is_pressed(button_id) > 0;
 }
 
 bool WindowBase::is_running() {
-  return !glfwWindowShouldClose(glfw_window_);
+  if (config_.show_window) {
+    return !glfwWindowShouldClose(glfw_window_);
+  }
+  return true;
 }
 
 void WindowBase::set_is_running(bool value) {
-  glfwSetWindowShouldClose(glfw_window_, !value);
+  if (config_.show_window) {
+    glfwSetWindowShouldClose(glfw_window_, !value);
+  }
 }
 
 std::pair<float, float> WindowBase::get_cursor_pos() {
+  CHECK_WINDOW_SHOWING;
   float x = input_handler_.last_x();
-  float y = input_handler_.last_y();
+  float y = 1.0 - input_handler_.last_y();
 
-  x = x / (float)config_.width;
-  y = (config_.height - y) / (float)config_.height;
   return std::make_pair(x, y);
 }
 
 std::vector<Event> WindowBase::get_events(EventType tag) {
+  CHECK_WINDOW_SHOWING;
   glfwPollEvents();
   std::vector<Event> result;
   std::list<Event>::iterator i = events_.begin();
@@ -92,6 +127,7 @@ std::vector<Event> WindowBase::get_events(EventType tag) {
 }
 
 bool WindowBase::get_event(EventType tag) {
+  CHECK_WINDOW_SHOWING;
   glfwPollEvents();
   if (events_.size() == 0) {
     return false;
@@ -115,17 +151,22 @@ bool WindowBase::get_event(EventType tag) {
 
 // these 2 are used to export the `current_event` field to python
 Event WindowBase::get_current_event() {
+  CHECK_WINDOW_SHOWING;
   return current_event_;
 }
 void WindowBase::set_current_event(const Event &event) {
+  CHECK_WINDOW_SHOWING;
   current_event_ = event;
 }
 
 WindowBase::~WindowBase() {
-  glfwDestroyWindow(glfw_window_);
+  if (config_.show_window) {
+    glfwDestroyWindow(glfw_window_);
+    taichi::lang::window_system::glfw_context_release();
+  }
 }
 
-GuiBase *WindowBase::GUI() {
+GuiBase *WindowBase::gui() {
   return nullptr;
 }
 
@@ -157,4 +198,4 @@ void WindowBase::mouse_button_callback(GLFWwindow *glfw_window,
                                                modifier);
 }
 
-TI_UI_NAMESPACE_END
+}  // namespace taichi::ui

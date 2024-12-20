@@ -4,7 +4,7 @@
 #include "taichi/ir/visitors.h"
 #include "taichi/system/profiler.h"
 
-TLANG_NAMESPACE_BEGIN
+namespace taichi::lang {
 
 // Replace all usages statement A with a new statement B.
 // Note that the original statement A is NOT replaced.
@@ -53,6 +53,10 @@ class StatementUsageReplace : public IRVisitor {
     stmt->body->accept(this);
   }
 
+  void visit(MeshForStmt *stmt) override {
+    stmt->body->accept(this);
+  }
+
   void visit(OffloadedStmt *stmt) override {
     stmt->all_blocks_accept(this);
   }
@@ -89,4 +93,4 @@ void replace_all_usages_with(IRNode *root, Stmt *old_stmt, Stmt *new_stmt) {
 
 }  // namespace irpass
 
-TLANG_NAMESPACE_END
+}  // namespace taichi::lang

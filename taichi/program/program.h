@@ -5,82 +5,33 @@
 #include <functional>
 #include <optional>
 #include <atomic>
+#include <stack>
+#include <shared_mutex>
 
 #define TI_RUNTIME_HOST
+#include "taichi/aot/module_builder.h"
+#include "taichi/ir/frontend_ir.h"
 #include "taichi/ir/ir.h"
 #include "taichi/ir/type_factory.h"
 #include "taichi/ir/snode.h"
-#include "taichi/lang_util.h"
+#include "taichi/util/lang_util.h"
+#include "taichi/program/argpack.h"
 #include "taichi/program/program_impl.h"
 #include "taichi/program/callable.h"
-#include "taichi/program/aot_module_builder.h"
 #include "taichi/program/function.h"
 #include "taichi/program/kernel.h"
 #include "taichi/program/kernel_profiler.h"
 #include "taichi/program/snode_expr_utils.h"
 #include "taichi/program/snode_rw_accessors_bank.h"
 #include "taichi/program/context.h"
-#include "taichi/runtime/runtime.h"
 #include "taichi/struct/snode_tree.h"
-#include "taichi/system/memory_pool.h"
 #include "taichi/system/threading.h"
-#include "taichi/system/unified_allocator.h"
 #include "taichi/program/sparse_matrix.h"
+#include "taichi/ir/mesh.h"
 
-namespace taichi {
-namespace lang {
-
-struct JITEvaluatorId {
-  std::thread::id thread_id;
-  // Note that on certain backends (e.g. CUDA), functions created in one
-  // thread cannot be used in another. Hence the thread_id member.
-  int op;
-  DataType ret, lhs, rhs;
-  bool is_binary;
-
-  UnaryOpType unary_op() const {
-    TI_ASSERT(!is_binary);
-    return (UnaryOpType)op;
-  }
-
-  BinaryOpType binary_op() const {
-    TI_ASSERT(is_binary);
-    return (BinaryOpType)op;
-  }
-
-  bool operator==(const JITEvaluatorId &o) const {
-    return thread_id == o.thread_id && op == o.op && ret == o.ret &&
-           lhs == o.lhs && rhs == o.rhs && is_binary == o.is_binary;
-  }
-};
-
-}  // namespace lang
-}  // namespace taichi
-
-namespace std {
-template <>
-struct hash<taichi::lang::JITEvaluatorId> {
-  std::size_t operator()(
-      taichi::lang::JITEvaluatorId const &id) const noexcept {
-    return ((std::size_t)id.op | (id.ret.hash() << 8) | (id.lhs.hash() << 16) |
-            (id.rhs.hash() << 24) | ((std::size_t)id.is_binary << 31)) ^
-           (std::hash<std::thread::id>{}(id.thread_id) << 32);
-  }
-};
-}  // namespace std
-
-namespace taichi {
-namespace lang {
-
-extern Program *current_program;
-
-TI_FORCE_INLINE Program &get_current_program() {
-  return *current_program;
-}
+namespace taichi::lang {
 
 class StructCompiler;
-class LlvmProgramImpl;
-class AsyncEngine;
 
 /**
  * Note [Backend-specific ProgramImpl]
@@ -95,27 +46,17 @@ class AsyncEngine;
  * LlvmProgramImpl, MetalProgramImpl..
  */
 
-class Program {
+class TI_DLL_EXPORT Program {
  public:
   using Kernel = taichi::lang::Kernel;
-  Callable *current_callable{nullptr};
-  CompileConfig config;
-  bool sync{false};  // device/host synchronized?
 
-  uint64 *result_buffer{nullptr};  // Note result_buffer is used by all backends
-
-  std::unordered_map<int, SNode *>
-      snodes;  // TODO: seems LLVM specific but used by state_flow_graph.cpp.
-
-  std::unique_ptr<AsyncEngine> async_engine{nullptr};
+  uint64 *result_buffer{nullptr};  // Note that this result_buffer is used
+                                   // only for runtime JIT functions (e.g.
+                                   // `runtime_memory_allocate_aligned`)
 
   std::vector<std::unique_ptr<Kernel>> kernels;
 
   std::unique_ptr<KernelProfilerBase> profiler{nullptr};
-
-  std::unordered_map<JITEvaluatorId, std::unique_ptr<Kernel>>
-      jit_evaluator_cache;
-  std::mutex jit_evaluator_cache_mut;
 
   // Note: for now we let all Programs share a single TypeFactory for smooth
   // migration. In the future each program should have its own copy.
@@ -128,8 +69,8 @@ class Program {
 
   ~Program();
 
-  void print_kernel_profile_info() {
-    profiler->print();
+  const CompileConfig &compile_config() const {
+    return compile_config_;
   }
 
   struct KernelProfilerQueryResult {
@@ -164,9 +105,7 @@ class Program {
 
   void synchronize();
 
-  // See AsyncEngine::flush().
-  // Only useful when async mode is enabled.
-  void async_flush();
+  StreamSemaphore flush();
 
   /**
    * Materializes the runtime.
@@ -175,13 +114,11 @@ class Program {
 
   int get_snode_tree_size();
 
-  void visualize_layout(const std::string &fn);
-
-  Kernel &kernel(const std::function<void()> &body,
+  Kernel &kernel(const std::function<void(Kernel *)> &body,
                  const std::string &name = "",
-                 bool grad = false) {
+                 AutodiffMode autodiff_mode = AutodiffMode::kNone) {
     // Expr::set_allow_store(true);
-    auto func = std::make_unique<Kernel>(*this, body, name, grad);
+    auto func = std::make_unique<Kernel>(*this, body, name, autodiff_mode);
     // Expr::set_allow_store(false);
     kernels.emplace_back(std::move(func));
     return *kernels.back();
@@ -189,13 +126,16 @@ class Program {
 
   Function *create_function(const FunctionKey &func_key);
 
-  // TODO: This function is doing two things: 1) compiling CHI IR, and 2)
-  // offloading them to each backend. We should probably separate the logic?
-  // TODO: Optional offloaded is used by async mode, we might refactor it in the
-  // future.
-  FunctionType compile(Kernel &kernel, OffloadedStmt *offloaded = nullptr);
+  const CompiledKernelData &compile_kernel(const CompileConfig &compile_config,
+                                           const DeviceCapabilityConfig &caps,
+                                           const Kernel &kernel_def);
 
-  void check_runtime_error();
+  void launch_kernel(const CompiledKernelData &compiled_kernel_data,
+                     LaunchContextBuilder &ctx);
+
+  DeviceCapabilityConfig get_device_caps() {
+    return program_impl_->get_device_caps();
+  }
 
   Kernel &get_snode_reader(SNode *snode);
 
@@ -211,8 +151,6 @@ class Program {
   Arch get_host_arch() {
     return host_arch();
   }
-
-  Arch get_snode_accessor_arch();
 
   float64 get_total_compilation_time() {
     return total_compilation_time_;
@@ -235,8 +173,8 @@ class Program {
   // Returns zero if the SNode is statically allocated
   std::size_t get_snode_num_dynamically_allocated(SNode *snode);
 
-  inline SNodeGlobalVarExprMap *get_snode_to_glb_var_exprs() {
-    return &snode_to_glb_var_exprs_;
+  inline SNodeFieldMap *get_snode_to_fields() {
+    return &snode_to_fields_;
   }
 
   inline SNodeRwAccessorsBank &get_snode_rw_accessors_bank() {
@@ -254,9 +192,26 @@ class Program {
    * Adds a new SNode tree.
    *
    * @param root The root of the new SNode tree.
+   * @param compile_only Only generates the compiled type
    * @return The pointer to SNode tree.
+   *
+   * FIXME: compile_only is mostly a hack to make AOT & cross-compilation work.
+   * E.g. users who would like to AOT to a specific target backend can do so,
+   * even if their platform doesn't support that backend. Unfortunately, the
+   * current implementation would leave the backend in a mostly broken state. We
+   * need a cleaner design to support both AOT and JIT modes.
    */
-  SNodeTree *add_snode_tree(std::unique_ptr<SNode> root);
+  SNodeTree *add_snode_tree(std::unique_ptr<SNode> root, bool compile_only);
+
+  /**
+   * Allocates a SNode tree id for a new SNode tree
+   *
+   * @return The SNode tree id allocated
+   *
+   * Returns and consumes a free SNode tree id if there is any,
+   * Otherwise returns the size of `snode_trees_`
+   */
+  int allocate_snode_tree_id();
 
   /**
    * Gets the root of a SNode tree.
@@ -266,23 +221,119 @@ class Program {
    */
   SNode *get_snode_root(int tree_id);
 
-  std::unique_ptr<AotModuleBuilder> make_aot_module_builder(Arch arch);
+  std::unique_ptr<AotModuleBuilder> make_aot_module_builder(
+      Arch arch,
+      const std::vector<std::string> &caps);
 
-  LlvmProgramImpl *get_llvm_program_impl();
+  size_t get_field_in_tree_offset(int tree_id, const SNode *child) {
+    return program_impl_->get_field_in_tree_offset(tree_id, child);
+  }
+
+  DevicePtr get_snode_tree_device_ptr(int tree_id) {
+    return program_impl_->get_snode_tree_device_ptr(tree_id);
+  }
+
+  Device *get_compute_device() {
+    return program_impl_->get_compute_device();
+  }
+
+  Device *get_graphics_device() {
+    return program_impl_->get_graphics_device();
+  }
+
+  // TODO: do we still need result_buffer?
+  DeviceAllocation allocate_memory_on_device(std::size_t alloc_size,
+                                             uint64 *result_buffer) {
+    return program_impl_->allocate_memory_on_device(alloc_size, result_buffer);
+  }
+  DeviceAllocation allocate_texture(const ImageParams &params) {
+    return program_impl_->allocate_texture(params);
+  }
+
+  Ndarray *create_ndarray(
+      const DataType type,
+      const std::vector<int> &shape,
+      ExternalArrayLayout layout = ExternalArrayLayout::kNull,
+      bool zero_fill = false,
+      const DebugInfo &dbg_info = DebugInfo());
+
+  ArgPack *create_argpack(const DataType dt);
+
+  std::string get_kernel_return_data_layout() {
+    return program_impl_->get_kernel_return_data_layout();
+  };
+
+  std::string get_kernel_argument_data_layout() {
+    return program_impl_->get_kernel_argument_data_layout();
+  };
+
+  std::pair<const StructType *, size_t> get_struct_type_with_data_layout(
+      const StructType *old_ty,
+      const std::string &layout);
+
+  std::pair<const ArgPackType *, size_t> get_argpack_type_with_data_layout(
+      const ArgPackType *old_ty,
+      const std::string &layout);
+
+  void delete_ndarray(Ndarray *ndarray);
+
+  void delete_argpack(ArgPack *argpack);
+
+  Texture *create_texture(BufferFormat buffer_format,
+                          const std::vector<int> &shape);
+
+  intptr_t get_ndarray_data_ptr_as_int(const Ndarray *ndarray);
+
+  void fill_ndarray_fast_u32(Ndarray *ndarray, uint32_t val);
+
+  Identifier get_next_global_id(const std::string &name = "") {
+    return Identifier(global_id_counter_++, name);
+  }
+
+  /** Enqueue a custom compute op to the current program execution flow.
+   *
+   *  @params op The lambda that is invoked to construct the custom compute Op
+   *  @params image_refs The image resource references used in this compute Op
+   */
+  void enqueue_compute_op_lambda(
+      std::function<void(Device *device, CommandList *cmdlist)> op,
+      const std::vector<ComputeOpImageRef> &image_refs);
+
+  /**
+   * TODO(zhanlue): Remove this interface
+   *
+   * Gets the underlying ProgramImpl object
+   *
+   * This interface is essentially a hack to temporarily accommodate
+   * historical design issues with LLVM backend
+   *
+   * Please limit its use to LLVM backend only
+   */
+  ProgramImpl *get_program_impl() {
+    TI_ASSERT(arch_uses_llvm(compile_config().arch));
+    return program_impl_.get();
+  }
+
+  // TODO(zhanlue): Move these members and corresponding interfaces to
+  // ProgramImpl Ideally, Program should serve as a pure interface class and all
+  // the implementations should fall inside ProgramImpl
+  //
+  // Once we migrated these implementations to ProgramImpl, lower-level objects
+  // could store ProgramImpl rather than Program.
 
  private:
-  /**
-   * Materializes a new SNodeTree.
-   *
-   * JIT compiles the @param tree to backend-specific data types.
-   */
-  void materialize_snode_tree(SNodeTree *tree);
+  CompileConfig compile_config_;
+
+  uint64 ndarray_writer_counter_{0};
+  uint64 ndarray_reader_counter_{0};
+  int global_id_counter_{0};
 
   // SNode information that requires using Program.
-  SNodeGlobalVarExprMap snode_to_glb_var_exprs_;
+  SNodeFieldMap snode_to_fields_;
   SNodeRwAccessorsBank snode_rw_accessors_bank_;
 
   std::vector<std::unique_ptr<SNodeTree>> snode_trees_;
+  std::stack<int> free_snode_tree_ids_;
 
   std::vector<std::unique_ptr<Function>> functions_;
   std::unordered_map<FunctionKey, Function *> function_map_;
@@ -292,8 +343,10 @@ class Program {
   static std::atomic<int> num_instances_;
   bool finalized_{false};
 
-  std::unique_ptr<MemoryPool> memory_pool_{nullptr};
+  // TODO: Move ndarrays_, argpacks_ and textures_ to be managed by runtime
+  std::unordered_map<void *, std::unique_ptr<Ndarray>> ndarrays_;
+  std::unordered_map<void *, std::unique_ptr<ArgPack>> argpacks_;
+  std::vector<std::unique_ptr<Texture>> textures_;
 };
 
-}  // namespace lang
-}  // namespace taichi
+}  // namespace taichi::lang
